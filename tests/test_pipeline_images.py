@@ -14,6 +14,7 @@ from itemadapter import ItemAdapter
 
 from scrapy.http import Request, Response
 from scrapy.item import Field, Item
+from scrapy.pipelines.files import GCSFilesStore, S3FilesStore
 from scrapy.pipelines.images import ImageException, ImagesPipeline
 from scrapy.utils.test import get_crawler
 
@@ -248,6 +249,34 @@ class TestImagesPipeline:
 
         with pytest.raises(TypeError, match="image_urls must be a list of URLs"):
             list(pipeline.get_media_requests(item, None))
+
+    def test_update_stores_applies_images_store_acl_settings(self, tmp_path):
+        """IMAGES_STORE_S3_ACL / IMAGES_STORE_GCS_ACL must configure the S3/GCS
+        stores used by ImagesPipeline (regression for issue #3: these settings
+        stopped being applied after 2ad5f0c12 removed the code that did so).
+        """
+        original_s3_policy = S3FilesStore.POLICY
+        original_gcs_policy = GCSFilesStore.POLICY
+        try:
+            ImagesPipeline.from_crawler(
+                get_crawler(
+                    None,
+                    {
+                        "IMAGES_STORE": str(tmp_path),
+                        "IMAGES_STORE_S3_ACL": "public-read",
+                        "IMAGES_STORE_GCS_ACL": "publicRead",
+                        # deliberately different, to prove IMAGES_STORE_* wins
+                        # for ImagesPipeline instead of FILES_STORE_*
+                        "FILES_STORE_S3_ACL": "private",
+                        "FILES_STORE_GCS_ACL": "",
+                    },
+                )
+            )
+            assert S3FilesStore.POLICY == "public-read"
+            assert GCSFilesStore.POLICY == "publicRead"
+        finally:
+            S3FilesStore.POLICY = original_s3_policy
+            GCSFilesStore.POLICY = original_gcs_policy
 
 
 class TestImagesPipelineFieldsMixin(ABC):

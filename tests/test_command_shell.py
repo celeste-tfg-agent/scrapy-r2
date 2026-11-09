@@ -11,6 +11,7 @@ from pexpect.popen_spawn import PopenSpawn
 
 from scrapy.utils.reactor import _asyncio_reactor_path
 from tests import NON_EXISTING_RESOLVABLE, tests_datadir
+from tests.test_commands import TestProjectBase
 from tests.utils.cmdline import proc
 
 if TYPE_CHECKING:
@@ -138,6 +139,52 @@ class TestShellCommand:
             "shell", "-c", code, "--set", "TWISTED_REACTOR_ENABLED=False"
         )
         assert ret == 0, err
+
+
+class TestShellCommandDoesNotCrawl(TestProjectBase):
+    """Regression tests for https://github.com/scrapy/scrapy/issues (issue #1):
+
+    ``scrapy shell URL`` must only fetch the given URL and must not run a
+    full crawl of the detected spider's start() requests.
+    """
+
+    project_name = "shellnocrawlproject"
+    spider_name = "shellspider"
+
+    @pytest.fixture(autouse=True)
+    def create_files(self, proj_path: Path) -> None:
+        proj_mod_path = proj_path / self.project_name
+        (proj_mod_path / "spiders" / "shellspider.py").write_text(
+            f"""
+import scrapy
+
+
+class ShellSpider(scrapy.Spider):
+    name = '{self.spider_name}'
+
+    async def start(self):
+        self.logger.info('START_METHOD_WAS_CALLED')
+        return
+        yield
+""",
+            encoding="utf-8",
+        )
+
+    def test_shell_does_not_run_spider_start(
+        self, proj_path: Path, mockserver: MockServer
+    ) -> None:
+        ret, out, err = proc(
+            "shell",
+            "--spider",
+            self.spider_name,
+            mockserver.url("/html"),
+            "-c",
+            "response.status",
+            cwd=proj_path,
+        )
+        assert ret == 0, err
+        assert out.strip().endswith("200")
+        assert "START_METHOD_WAS_CALLED" not in err
 
 
 class TestInteractiveShell:

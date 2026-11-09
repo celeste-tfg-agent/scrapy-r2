@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import csv
 import json
 import marshal
@@ -16,7 +17,7 @@ from packaging.version import Version
 import scrapy
 from scrapy import Spider
 from scrapy.exceptions import NotConfigured
-from scrapy.extensions.feedexport import FeedExporter, S3FeedStorage
+from scrapy.extensions.feedexport import FeedExporter, FileFeedStorage, S3FeedStorage
 from scrapy.settings import Settings
 from scrapy.utils.python import to_unicode
 from scrapy.utils.test import get_crawler
@@ -456,3 +457,54 @@ class TestBatchDeliveries(TestFeedExportBase):
         assert (
             crawler.stats.get_value("feedexport/success_count/CustomS3FeedStorage") == 3
         )
+
+
+class TestFeedExporterBatchEagerClose:
+    """Regression test for #6: a filled batch must be finalized and stored
+    as soon as it is filled, without waiting for the spider to close."""
+
+    @coroutine_test
+    async def test_batch_stored_before_spider_closes(self, tmp_path):
+        store_calls = []
+
+        class TrackingFileFeedStorage(FileFeedStorage):
+            def store(self, file):
+                store_calls.append(self.path)
+                return super().store(file)
+
+        settings = {
+            "FEEDS": {
+                build_url(tmp_path / "%(batch_id)d.json"): {"format": "json"},
+            },
+            "FEED_EXPORT_BATCH_ITEM_COUNT": 2,
+            "FEED_STORAGES": {"file": TrackingFileFeedStorage},
+        }
+        crawler = get_crawler(settings_dict=settings)
+        feed_exporter = FeedExporter.from_crawler(crawler)
+        spider = scrapy.Spider("default")
+        spider.crawler = crawler
+        feed_exporter.open_spider(spider)
+
+        # Two items fill up the first batch (batch_item_count=2).
+        feed_exporter.item_scraped({"foo": "bar1"}, spider)
+        feed_exporter.item_scraped({"foo": "bar2"}, spider)
+
+        # Give the event loop a chance to run the coroutine that was
+        # scheduled when the batch filled up, without calling close_spider.
+        for _ in range(5):
+            await asyncio.sleep(0)
+
+        assert len(store_calls) == 1, (
+            "The completed batch should have been stored as soon as it "
+            "filled up, before the spider closes"
+        )
+
+        # A third item starts a second, still incomplete, batch.
+        feed_exporter.item_scraped({"foo": "bar3"}, spider)
+        for _ in range(5):
+            await asyncio.sleep(0)
+        assert len(store_calls) == 1
+
+        # close_spider() must still flush the pending, non-empty batch.
+        await feed_exporter.close_spider(spider)
+        assert len(store_calls) == 2

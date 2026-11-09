@@ -6,13 +6,14 @@ See documentation in docs/topics/feed-exports.rst
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import logging
 import re
 import sys
 import warnings
 from abc import ABC, abstractmethod
-from collections.abc import Callable
+from collections.abc import Callable, Coroutine
 from datetime import datetime, timezone
 from pathlib import Path, PureWindowsPath
 from tempfile import NamedTemporaryFile
@@ -26,7 +27,7 @@ from zope.interface import Interface
 from scrapy import Spider, signals
 from scrapy.exceptions import NotConfigured, ScrapyDeprecationWarning
 from scrapy.extensions.postprocessing import PostProcessingManager
-from scrapy.utils.asyncio import run_in_thread
+from scrapy.utils.asyncio import is_asyncio_available, run_in_thread
 from scrapy.utils.conf import feed_complete_default_values_from_settings
 from scrapy.utils.defer import deferred_from_coro, ensure_awaitable
 from scrapy.utils.ftp import ftp_store_file
@@ -474,6 +475,7 @@ class FeedExporter:
         self.feeds = {}
         self.slots: list[FeedSlot] = []
         self.filters: dict[str, ItemFilter] = {}
+        self._pending_close_tasks: list[asyncio.Task[None]] = []
         self._pending_close_deferreds: list[Deferred[None]] = []
 
         if not self.settings["FEEDS"] and not self.settings["FEED_URI"]:
@@ -537,11 +539,28 @@ class FeedExporter:
                 )
             )
 
-    async def close_spider(self, spider: Spider) -> None:
-        self._pending_close_deferreds.extend(
-            deferred_from_coro(self._close_slot(slot, spider)) for slot in self.slots
-        )
+    def _schedule_close_slot(self, slot: FeedSlot, spider: Spider) -> None:
+        """Schedule the closing (and storing) of *slot* to run as soon as
+        possible, instead of only collecting it to be awaited when the
+        spider closes.
 
+        Without this, ``FeedStorage.store()`` and
+        ``exporter.finish_exporting()`` would only run once the whole crawl
+        has finished, even for batches that were already filled up long
+        before that (see issue #6).
+        """
+        coro: Coroutine[Any, Any, None] = self._close_slot(slot, spider)
+        if is_asyncio_available():
+            self._pending_close_tasks.append(asyncio.create_task(coro))
+        else:
+            self._pending_close_deferreds.append(deferred_from_coro(coro))
+
+    async def close_spider(self, spider: Spider) -> None:
+        for slot in self.slots:
+            self._schedule_close_slot(slot, spider)
+
+        if self._pending_close_tasks:
+            await asyncio.wait(self._pending_close_tasks)
         if self._pending_close_deferreds:
             await DeferredList(self._pending_close_deferreds)
 
@@ -644,9 +663,7 @@ class FeedExporter:
                 uri_params = self._get_uri_params(
                     spider, self.feeds[slot.uri_template]["uri_params"], slot
                 )
-                self._pending_close_deferreds.append(
-                    deferred_from_coro(self._close_slot(slot, spider))
-                )
+                self._schedule_close_slot(slot, spider)
                 slots.append(
                     self._start_new_batch(
                         batch_id=slot.batch_id + 1,

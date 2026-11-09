@@ -205,7 +205,22 @@ class RobotsTxtMiddleware:
 
         parser = self._parsers[netloc]
         if isinstance(parser, Deferred):
-            return await maybe_deferred_to_future(parser)
+            # Converting the same shared, still-pending Deferred to a Future
+            # once per waiter is unsafe: Deferred.asFuture() registers a
+            # callback that does not forward its input, so only the first
+            # callback added to a Deferred receives the real result; every
+            # later one (i.e. every waiter beyond the first) gets None. Give
+            # each waiter its own Deferred instead, explicitly fed with the
+            # shared result while still passing that result through
+            # unchanged for the next waiter in the chain.
+            waiter: Deferred[RobotParser | None] = Deferred()
+
+            def _settle(result: RobotParser | None) -> RobotParser | None:
+                waiter.callback(result)
+                return result
+
+            parser.addCallback(_settle)
+            return await maybe_deferred_to_future(waiter)
         return parser
 
     async def _parse_robots(

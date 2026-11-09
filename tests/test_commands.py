@@ -12,6 +12,7 @@ import pytest
 import scrapy
 from scrapy.cmdline import _pop_command_name, _print_unknown_command_msg
 from scrapy.commands import ScrapyCommand, ScrapyHelpFormatter, view
+from scrapy.exceptions import ScrapyDeprecationWarning
 from scrapy.settings import Settings
 from scrapy.utils.reactor import _asyncio_reactor_path
 from tests.utils.cmdline import call, proc
@@ -60,6 +61,13 @@ class TestCommandSettings:
             "Optional Arguments\n==================\n\n"
             "Global Options\n--------------\n"
         )
+
+    def test_help_is_deprecated(self):
+        """ScrapyCommand.help() is never called by Scrapy (there is no "help"
+        command) and should warn when used, see issue #4."""
+        with pytest.warns(ScrapyDeprecationWarning, match="ScrapyCommand.help\\(\\)"):
+            result = self.command.help()
+        assert result == self.command.long_desc()
 
 
 class TestProjectBase:

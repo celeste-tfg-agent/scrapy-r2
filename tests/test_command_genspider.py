@@ -162,6 +162,26 @@ class TestGenspiderCommand(TestProjectBase):
         assert m is not None
         assert m.group(1) == expected
 
+    def test_edit(self, proj_path: Path) -> None:
+        """Regression test for issue #5: `genspider --edit` used to spawn a
+        `scrapy edit` subprocess that failed with ModuleNotFoundError because
+        it inherited SCRAPY_SETTINGS_MODULE without the matching sys.path
+        entry."""
+        spider = proj_path / self.project_name / "spiders" / "test_edit.py"
+        returncode, out, err = proc(
+            "genspider",
+            "--edit",
+            "-s",
+            "EDITOR=true",
+            "test_edit",
+            "test.com",
+            cwd=proj_path,
+        )
+        assert returncode == 0
+        assert "ModuleNotFoundError" not in out
+        assert "ModuleNotFoundError" not in err
+        assert spider.exists()
+
 
 class TestGenspiderStandaloneCommand:
     def test_generate_standalone_spider(self, tmp_path: Path) -> None:

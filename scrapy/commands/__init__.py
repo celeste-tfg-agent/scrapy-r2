@@ -67,11 +67,14 @@ class ScrapyCommand(ABC):
         """
         return self.short_desc()
 
-    def help(self) -> str:
-        """An extensive help for the command. It will be shown when using the
-        "help" command. It can contain newlines since no post-formatting will
-        be applied to its contents.
-        """
+    def help(self) -> str:  # pragma: no cover
+        """Deprecated, never called by Scrapy and not meant to be overridden."""
+        warnings.warn(
+            "ScrapyCommand.help() is deprecated and never called by Scrapy;"
+            " do not override or call it.",
+            ScrapyDeprecationWarning,
+            stacklevel=2,
+        )
         return self.long_desc()
 
     def add_options(self, parser: argparse.ArgumentParser) -> None:

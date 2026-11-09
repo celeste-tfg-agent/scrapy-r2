@@ -346,6 +346,13 @@ class TestStripUrl:
                 "ftp://username:password@www.example.com:221/file.txt",
                 "ftp://username:password@www.example.com:221/file.txt",
             ),
+            # https://github.com/scrapy/scrapy/issues/XXXX
+            # the port number (80) also appears inside the password; only
+            # the actual port at the end of the netloc must be stripped
+            (
+                "http://user:80@example.com:80/p",
+                "http://user:80@example.com/p",
+            ),
         ],
     )
     def test_default_ports(self, url: str, expected: str) -> None:

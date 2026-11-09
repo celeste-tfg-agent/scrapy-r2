@@ -476,7 +476,7 @@ class TestFeedExporterBatchEagerClose:
             "FEEDS": {
                 build_url(tmp_path / "%(batch_id)d.json"): {"format": "json"},
             },
-            "FEED_EXPORT_BATCH_ITEM_COUNT": 1,
+            "FEED_EXPORT_BATCH_ITEM_COUNT": 2,
             "FEED_STORAGES": {"file": TrackingFileFeedStorage},
         }
         crawler = get_crawler(settings_dict=settings)
@@ -485,8 +485,9 @@ class TestFeedExporterBatchEagerClose:
         spider.crawler = crawler
         feed_exporter.open_spider(spider)
 
-        # A single item already fills the only batch slot (batch_item_count=1).
+        # Two items fill up the first batch (batch_item_count=2).
         feed_exporter.item_scraped({"foo": "bar1"}, spider)
+        feed_exporter.item_scraped({"foo": "bar2"}, spider)
 
         # Give the event loop a chance to run the coroutine that was
         # scheduled when the batch filled up, without calling close_spider.
@@ -498,5 +499,12 @@ class TestFeedExporterBatchEagerClose:
             "filled up, before the spider closes"
         )
 
+        # A third item starts a second, still incomplete, batch.
+        feed_exporter.item_scraped({"foo": "bar3"}, spider)
+        for _ in range(5):
+            await asyncio.sleep(0)
+        assert len(store_calls) == 1
+
+        # close_spider() must still flush the pending, non-empty batch.
         await feed_exporter.close_spider(spider)
         assert len(store_calls) == 2

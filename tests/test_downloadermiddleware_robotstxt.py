@@ -121,6 +121,25 @@ Disallow: /some/randome/page.html
         c2 = middleware.process_request(Request("http://site.local/allowed2"))
         await asyncio.gather(c1, c2)
 
+    @pytest.mark.only_asyncio
+    @coroutine_test
+    async def test_robotstxt_multiple_denied_reqs_asyncio(self) -> None:
+        # Regression test for the fail-open race described in issue #8: the
+        # 1st request triggers the robots.txt download, while the 2nd and
+        # 3rd become concurrent waiters on the same still-pending Deferred.
+        # Every one of them targets a path disallowed by robots.txt, so all
+        # three must raise IgnoreRequest, including the 3rd (the 2nd waiter
+        # on the shared Deferred), which used to get a None parser and be let
+        # through.
+        middleware = build_from_crawler(
+            RobotsTxtMiddleware, self._get_successful_crawler()
+        )
+        c1 = middleware.process_request(Request("http://site.local/admin/a"))
+        c2 = middleware.process_request(Request("http://site.local/admin/b"))
+        c3 = middleware.process_request(Request("http://site.local/admin/c"))
+        results = await asyncio.gather(c1, c2, c3, return_exceptions=True)
+        assert all(isinstance(r, IgnoreRequest) for r in results), results
+
     @coroutine_test
     async def test_robotstxt_ready_parser(self):
         middleware = build_from_crawler(

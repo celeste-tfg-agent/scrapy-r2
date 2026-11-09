@@ -7,6 +7,7 @@ See documentation in topics/media-pipeline.rst
 from __future__ import annotations
 
 import base64
+import calendar
 import functools
 import hashlib
 import logging
@@ -15,6 +16,7 @@ import time
 import warnings
 from collections import defaultdict
 from contextlib import suppress
+from datetime import datetime, timezone
 from ftplib import FTP
 from io import BytesIO
 from pathlib import Path
@@ -202,7 +204,9 @@ class S3FilesStore:
     def _onsuccess(boto_key: dict[str, Any]) -> StatInfo:
         checksum = boto_key["ETag"].strip('"')
         last_modified = boto_key["LastModified"]
-        modified_stamp = time.mktime(last_modified.timetuple())
+        # last_modified is a timezone-aware UTC datetime; converting it with
+        # time.mktime() would wrongly treat it as local time.
+        modified_stamp = calendar.timegm(last_modified.utctimetuple())
         return {"checksum": checksum, "last_modified": modified_stamp}
 
     def stat_file(
@@ -326,7 +330,9 @@ class GCSFilesStore:
     def _onsuccess(blob: Any) -> StatInfo:
         if blob:
             checksum = base64.b64decode(blob.md5_hash).hex()
-            last_modified = time.mktime(blob.updated.timetuple())
+            # blob.updated is a timezone-aware UTC datetime; converting it
+            # with time.mktime() would wrongly treat it as local time.
+            last_modified = calendar.timegm(blob.updated.utctimetuple())
             return {"checksum": checksum, "last_modified": last_modified}
         return {}
 
@@ -420,7 +426,15 @@ class FTPFilesStore:
                 if self.USE_ACTIVE_MODE:
                     ftp.set_pasv(False)
                 file_path = f"{self.basedir}/{path}"
-                last_modified = float(ftp.voidcmd(f"MDTM {file_path}")[4:].strip())
+                # The MDTM response is a UTC timestamp in YYYYMMDDHHMMSS[.sss]
+                # format (RFC 3659), not a Unix timestamp, so it must be
+                # parsed as a UTC datetime rather than cast to float directly.
+                mdtm_response = ftp.voidcmd(f"MDTM {file_path}")[4:].strip()
+                last_modified = (
+                    datetime.strptime(mdtm_response.split(".")[0], "%Y%m%d%H%M%S")
+                    .replace(tzinfo=timezone.utc)
+                    .timestamp()
+                )
                 m = hashlib.md5()  # noqa: S324
                 ftp.retrbinary(f"RETR {file_path}", m.update)
             return {"last_modified": last_modified, "checksum": m.hexdigest()}

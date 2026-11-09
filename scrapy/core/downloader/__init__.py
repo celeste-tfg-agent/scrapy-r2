@@ -1,0 +1,563 @@
+from __future__ import annotations
+
+import asyncio
+import random
+import warnings
+from collections import deque
+from dataclasses import dataclass, field
+from logging import getLogger
+from time import monotonic, perf_counter, time
+from typing import TYPE_CHECKING, Any
+
+from twisted.internet.defer import Deferred, DeferredList, inlineCallbacks
+
+from scrapy import Request, Spider, signals
+from scrapy.core.downloader.handlers import DownloadHandlers
+from scrapy.core.downloader.middleware import DownloaderMiddlewareManager
+from scrapy.exceptions import DownloadCancelledError, ScrapyDeprecationWarning
+from scrapy.resolver import dnscache
+from scrapy.settings import SETTINGS_PRIORITIES
+from scrapy.utils.asyncio import (
+    AsyncioLoopingCall,
+    CallLaterResult,
+    call_later,
+    create_looping_call,
+    sleep,
+)
+from scrapy.utils.decorators import _warn_spider_arg
+from scrapy.utils.defer import (
+    _process_pending_io,
+    deferred_from_coro,
+    maybe_deferred_to_future,
+)
+from scrapy.utils.httpobj import urlparse_cached
+from scrapy.utils.misc import build_from_crawler
+
+if TYPE_CHECKING:
+    from collections.abc import Generator
+
+    from twisted.internet.task import LoopingCall
+
+    from scrapy.crawler import Crawler
+    from scrapy.http import Response
+    from scrapy.settings import BaseSettings
+    from scrapy.signalmanager import SignalManager
+
+logger = getLogger(__name__)
+
+
+# Request.meta key holding the delay of a request and the time before which it
+# must not be sent because of it. The deadline is a wall-clock time, so that it
+# survives a crawl being resumed from a disk queue.
+_DELAY_DEADLINE_META_KEY = "_delay_deadline"
+
+
+def _start_delay_countdown(request: Request) -> None:
+    """Turn the ``delay`` meta key of *request*, if any, into a deadline.
+
+    Requests are stamped as they are scheduled, so that their delay runs while
+    they wait for their turn instead of only once they get it.
+
+    ``delay`` is consumed, so that a copy of the request, such as a retry or a
+    redirect, is not held again, while setting the key again asks for a new
+    delay. What the request has been through is left on ``delayed``.
+    """
+    delay = request.meta.pop("delay", None)
+    if not delay:
+        return
+    delay = float(delay)
+    request.meta[_DELAY_DEADLINE_META_KEY] = (delay, time() + delay)
+    request.meta["delayed"] = [*request.meta.get("delayed", []), delay]
+
+
+@dataclass(slots=True, eq=False)
+class Slot:
+    """Downloader slot"""
+
+    concurrency: int
+    delay: float
+    jitter: float
+
+    active: set[Request] = field(default_factory=set, init=False, repr=False)
+    queue: deque[tuple[Request, Deferred[Response]]] = field(
+        default_factory=deque, init=False, repr=False
+    )
+    transferring: set[Request] = field(default_factory=set, init=False, repr=False)
+    lastseen: float = field(default=0, init=False, repr=False)
+    latercall: CallLaterResult | None = field(default=None, init=False, repr=False)
+
+    # Hand-written to accept the deprecated randomize_delay parameter, which
+    # means it also has to initialize the fields above.
+    def __init__(
+        self,
+        concurrency: int,
+        delay: float,
+        jitter: float | None = None,
+        randomize_delay: bool | None = None,
+    ) -> None:
+        if isinstance(jitter, bool):
+            # randomize_delay used to be the third positional parameter, and a
+            # boolean would otherwise pass for a magnitude, True meaning ±100%.
+            jitter, randomize_delay = None, jitter
+        if randomize_delay is not None:
+            warnings.warn(
+                "The randomize_delay parameter of Slot is deprecated, use "
+                "jitter instead: it takes the magnitude of the random variation "
+                "as a number, e.g. 0.5 for the ±50% that randomize_delay "
+                "enables, or 0 to disable it.",
+                category=ScrapyDeprecationWarning,
+                stacklevel=2,
+            )
+        self.concurrency = concurrency
+        self.delay = delay
+        self.jitter = jitter if jitter is not None else 0.5 * bool(randomize_delay)
+        self.active = set()
+        self.queue = deque()
+        self.transferring = set()
+        self.lastseen = 0
+        self.latercall = None
+
+    @property
+    def randomize_delay(self) -> bool:
+        warnings.warn(
+            "Slot.randomize_delay is deprecated, use Slot.jitter instead.",
+            category=ScrapyDeprecationWarning,
+            stacklevel=2,
+        )
+        return bool(self.jitter)
+
+    @randomize_delay.setter
+    def randomize_delay(self, value: bool) -> None:
+        warnings.warn(
+            "Slot.randomize_delay is deprecated, use Slot.jitter instead.",
+            category=ScrapyDeprecationWarning,
+            stacklevel=2,
+        )
+        self.jitter = 0.5 if value else 0.0
+
+    def free_transfer_slots(self) -> int:
+        return self.concurrency - len(self.transferring)
+
+    def download_delay(self) -> float:
+        if not self.jitter:
+            return self.delay
+        # A jitter above 1 would reach into negative delays, floored at 0.
+        return max(0.0, self.delay * (1 + random.uniform(-self.jitter, self.jitter)))  # noqa: S311
+
+    def close(self) -> None:
+        if self.latercall:
+            self.latercall.cancel()
+            self.latercall = None
+
+    def __str__(self) -> str:
+        return (
+            f"<downloader.Slot concurrency={self.concurrency!r} "
+            f"delay={self.delay:.2f} jitter={self.jitter!r} "
+            f"len(active)={len(self.active)} len(queue)={len(self.queue)} "
+            f"len(transferring)={len(self.transferring)} "
+            f"lastseen={self.lastseen:.2f}>"
+        )
+
+
+def _default_jitter(settings: BaseSettings) -> float:
+    """Return the magnitude of the random variation to apply to the delay of
+    slots that do not set their own ``jitter``: :setting:`DOWNLOAD_DELAY_JITTER`,
+    or the deprecated ``RANDOMIZE_DOWNLOAD_DELAY`` when set at a higher
+    :ref:`priority <populating-settings>`, mapped to the historical ±50% or
+    none.
+
+    Warns when ``RANDOMIZE_DOWNLOAD_DELAY`` is set, so it is called once per
+    crawl, from :meth:`Downloader.__init__`. Both defaults mean the same ±50%,
+    so a crawl that sets neither needs no warning.
+    """
+    randomize_priority = settings.getpriority("RANDOMIZE_DOWNLOAD_DELAY") or 0
+    if randomize_priority <= SETTINGS_PRIORITIES["default"]:
+        return settings.getfloat("DOWNLOAD_DELAY_JITTER")
+    warnings.warn(
+        "The RANDOMIZE_DOWNLOAD_DELAY setting is deprecated, use "
+        "DOWNLOAD_DELAY_JITTER instead: it takes the magnitude of the random "
+        "variation as a number, e.g. 0.5 for the ±50% that "
+        "RANDOMIZE_DOWNLOAD_DELAY enables, or 0 to disable it.",
+        category=ScrapyDeprecationWarning,
+        stacklevel=3,
+    )
+    if randomize_priority > (settings.getpriority("DOWNLOAD_DELAY_JITTER") or 0):
+        return 0.5 if settings.getbool("RANDOMIZE_DOWNLOAD_DELAY") else 0.0
+    return settings.getfloat("DOWNLOAD_DELAY_JITTER")
+
+
+def _slot_jitter(slot_settings: dict[str, Any], default: float) -> float:
+    """Return the jitter of a :setting:`DOWNLOAD_SLOTS` entry, from its
+    ``jitter`` key, its deprecated ``randomize_delay`` key, or *default*."""
+    if "jitter" in slot_settings:
+        return float(slot_settings["jitter"])
+    if "randomize_delay" in slot_settings:
+        warnings.warn(
+            "The randomize_delay key of the DOWNLOAD_SLOTS setting is "
+            "deprecated, use jitter instead: it takes the magnitude of the "
+            "random variation as a number, e.g. 0.5 for the ±50% that "
+            "randomize_delay enables, or 0 to disable it.",
+            category=ScrapyDeprecationWarning,
+            stacklevel=3,
+        )
+        return 0.5 if slot_settings["randomize_delay"] else 0.0
+    return default
+
+
+_STAMPED_SLOT_META_KEY = "_download_slot_stamp"
+
+
+class Downloader:
+    DOWNLOAD_SLOT = "download_slot"
+    _SLOT_GC_INTERVAL: float = 60.0  # seconds
+
+    def __init__(self, crawler: Crawler):
+        self.crawler: Crawler = crawler
+        self.settings: BaseSettings = crawler.settings
+        self.signals: SignalManager = crawler.signals
+        self.slots: dict[str, Slot] = {}
+        self.active: set[Request] = set()
+        self.handlers: DownloadHandlers = DownloadHandlers(crawler)
+        self.total_concurrency: int = self.settings.getint("CONCURRENT_REQUESTS")
+        self.domain_concurrency: int = self.settings.getint(
+            "CONCURRENT_REQUESTS_PER_DOMAIN"
+        )
+        self.ip_concurrency: int = self.settings.getint("CONCURRENT_REQUESTS_PER_IP")
+        # Default delay of new slots. AutoThrottle overrides it to apply
+        # AUTOTHROTTLE_START_DELAY.
+        self._delay: float = self.settings.getfloat("DOWNLOAD_DELAY")
+        self._jitter: float = _default_jitter(self.settings)
+        self.middleware: DownloaderMiddlewareManager = build_from_crawler(
+            DownloaderMiddlewareManager, crawler
+        )
+        self._slot_gc_loop: AsyncioLoopingCall[..., None] | LoopingCall | None = None
+        self._accepting_requests: bool = True
+        self._download_tasks: dict[Request, Deferred[None]] = {}
+        self.per_slot_settings: dict[str, dict[str, Any]] = self.settings.getdict(
+            "DOWNLOAD_SLOTS"
+        )
+        self._stats = crawler.stats
+        # (reason, start_time): current backout reason and when it began, or
+        # (None, None) if not backing out.
+        self._last_backout: tuple[str | None, float | None] = (None, None)
+        self._max_active_size_warned = False
+
+    @property
+    def randomize_delay(self) -> bool:
+        warnings.warn(
+            "Downloader.randomize_delay is deprecated, use the "
+            "DOWNLOAD_DELAY_JITTER setting instead.",
+            category=ScrapyDeprecationWarning,
+            stacklevel=2,
+        )
+        return bool(self._jitter)
+
+    @inlineCallbacks
+    @_warn_spider_arg
+    def fetch(
+        self, request: Request, spider: Spider | None = None
+    ) -> Generator[Deferred[Any], Any, Response | Request]:
+        self.active.add(request)
+        self.middleware._count_rough_size(request)
+        try:
+            result: Response | Request = yield (
+                deferred_from_coro(
+                    self.middleware.download_async(self._enqueue_request, request)
+                )
+            )
+            return result
+        finally:
+            self.active.remove(request)
+            self.middleware._discount_rough_size(request)
+
+    def _record_backout(self, reason: str | None) -> None:
+        last_reason, last_reason_start_time = self._last_backout
+        if last_reason == reason:
+            return
+        current_time = perf_counter()
+        if last_reason is not None and self._stats is not None:
+            assert last_reason_start_time is not None
+            last_reason_seconds = current_time - last_reason_start_time
+            self._stats.inc_value("request_backout_seconds/total", last_reason_seconds)
+            self._stats.inc_value(
+                f"request_backout_seconds/{last_reason}", last_reason_seconds
+            )
+        self._last_backout = (reason, current_time)
+
+    def needs_backout(self) -> bool:
+        # A total concurrency of 0 means no limit.
+        if 0 < self.total_concurrency <= len(self.active):
+            self._record_backout("concurrency")
+            return True
+        if self._exceeds_max_active_size():
+            self._record_backout("response_max_active_size")
+            if not self._max_active_size_warned:
+                self._max_active_size_warned = True
+                logger.info(
+                    f"Pausing request processing: the active response size "
+                    f"({self.middleware._total_active_size} B) has reached "
+                    f"RESPONSE_MAX_ACTIVE_SIZE "
+                    f"({self.middleware._max_active_size} B). See "
+                    f"https://docs.scrapy.org/en/latest/topics/settings.html#response-max-active-size "
+                    f"and the request_backout_seconds/response_max_active_size "
+                    f"stat. This message is only logged once."
+                )
+            return True
+        self._record_backout(None)
+        return False
+
+    def _exceeds_max_active_size(self) -> bool:
+        max_active_size = self.middleware._max_active_size
+        return (
+            bool(max_active_size)
+            and self.middleware._total_active_size >= max_active_size
+        )
+
+    @_warn_spider_arg
+    def _get_slot(
+        self, request: Request, spider: Spider | None = None
+    ) -> tuple[str, Slot]:
+        key = self.get_slot_key(request)
+        if key not in self.slots:
+            slot_settings = self.per_slot_settings.get(key, {})
+            conc = slot_settings.get(
+                "concurrency", self.ip_concurrency or self.domain_concurrency
+            )
+            delay = slot_settings.get("delay", self._delay)
+            new_slot = Slot(conc, delay, _slot_jitter(slot_settings, self._jitter))
+            self.slots[key] = new_slot
+            self._start_slot_gc()
+
+        return key, self.slots[key]
+
+    def get_slot_key(self, request: Request) -> str:
+        meta_slot: str | None = request.meta.get(self.DOWNLOAD_SLOT)
+        if meta_slot is not None and meta_slot != request.meta.get(
+            _STAMPED_SLOT_META_KEY
+        ):
+            return meta_slot
+
+        key = urlparse_cached(request).hostname or ""
+        if self.ip_concurrency:
+            key = dnscache.get(key, key)
+
+        return key
+
+    async def _delay_request(self, request: Request) -> None:
+        """Hold *request* until the deadline of its ``delay`` meta key.
+
+        The wait happens before the request gets a slot, so it does not take a
+        slot concurrency spot.
+        """
+        # A request that skipped the scheduler, e.g. one from
+        # ExecutionEngine.download_async(), starts its countdown here.
+        _start_delay_countdown(request)
+        countdown = request.meta.pop(_DELAY_DEADLINE_META_KEY, None)
+        if countdown is None:
+            return
+        delay, deadline = countdown
+        # A deadline further away than the delay means the clock moved backwards
+        # since it was set, which takes a crawl resumed from a disk queue, e.g.
+        # on a machine with a lagging clock. Capping keeps the wait to what the
+        # delay asked for.
+        wait = min(deadline - time(), delay)
+        if wait > 0:
+            await sleep(wait)
+
+    # passed as download_func into self.middleware.download() in self.fetch()
+    async def _enqueue_request(self, request: Request) -> Response:
+        await self._delay_request(request)
+        if not self._accepting_requests:
+            raise DownloadCancelledError(
+                "The downloader is shutting down and not accepting new requests"
+            )
+        key, slot = self._get_slot(request)
+        # Requests derived from this one (redirects, retries) copy its meta.
+        # The stamp tells a slot the downloader assigned, which they must
+        # resolve again for their own URL, from one set by the user, which
+        # they keep.
+        previous: str | None = request.meta.get(self.DOWNLOAD_SLOT)
+        if previous is None or previous == request.meta.get(_STAMPED_SLOT_META_KEY):
+            request.meta[_STAMPED_SLOT_META_KEY] = key
+        request.meta[self.DOWNLOAD_SLOT] = key
+        slot.active.add(request)
+        self.signals.send_catch_log(
+            signal=signals.request_reached_downloader,
+            request=request,
+            spider=self.crawler.spider,
+        )
+        d: Deferred[Response] = Deferred()
+        slot.queue.append((request, d))
+        self._process_queue(slot)
+        try:
+            return await maybe_deferred_to_future(d)  # fired in _wait_for_download()
+        finally:
+            slot.active.remove(request)
+
+    def _process_queue(self, slot: Slot) -> None:
+        if slot.latercall:
+            # block processing until slot.latercall is called
+            return
+
+        # Delay queue processing if a download_delay is configured
+        now = monotonic()
+        delay = slot.download_delay()
+        if delay:
+            penalty = delay - now + slot.lastseen
+            if penalty > 0:
+                slot.latercall = call_later(penalty, self._latercall, slot)
+                return
+
+        # Process enqueued requests if there are free slots to transfer for this slot
+        while slot.queue and slot.free_transfer_slots() > 0:
+            slot.lastseen = now
+            request, queue_dfd = slot.queue.popleft()
+            # Do this immediately so that following free_transfer_slots() calls
+            # account for this request.
+            slot.transferring.add(request)
+            download_dfd = deferred_from_coro(
+                self._wait_for_download(slot, request, queue_dfd)
+            )
+            assert isinstance(download_dfd, Deferred)
+            self._download_tasks[request] = download_dfd
+            download_dfd.addBoth(self._download_task_done, request)
+            download_dfd.addBoth(self._release_unstarted, slot, request, queue_dfd)
+            # prevent burst if inter-request delays were configured
+            if delay:
+                self._process_queue(slot)
+                break
+
+    def _download_task_done(self, result: Any, request: Request) -> Any:
+        self._download_tasks.pop(request, None)
+        return result
+
+    def _release_unstarted(
+        self, result: Any, slot: Slot, request: Request, queue_dfd: Deferred[Response]
+    ) -> Any:
+        # Runs when the download task finishes. The task itself normally ends
+        # the transfer (in _download()) and fires queue_dfd (in
+        # _wait_for_download()). But a task that is cancelled before it starts
+        # running, e.g. by stop(), never runs any of its code, so this does
+        # both instead.
+        if request in slot.transferring:
+            self._end_transfer(slot, request)
+        if not queue_dfd.called:
+            queue_dfd.errback(result)
+        return result
+
+    def _latercall(self, slot: Slot) -> None:
+        slot.latercall = None
+        self._process_queue(slot)
+
+    async def _download(self, slot: Slot, request: Request) -> Response:
+        # The order is very important for the following logic. Do not change!
+        try:
+            # 1. Download the response
+            response: Response = await self.handlers.download_request_async(request)
+            # 2. Notify response_downloaded listeners about the recent download
+            # before querying queue for next request
+            self.signals.send_catch_log(
+                signal=signals.response_downloaded,
+                response=response,
+                request=request,
+                spider=self.crawler.spider,
+            )
+            return response
+        except Exception:
+            await _process_pending_io()
+            raise
+        finally:
+            # 3. After response arrives, remove the request from transferring
+            # state to free up the transferring slot so it can be used by the
+            # following requests (perhaps those which came from the downloader
+            # middleware itself)
+            self._end_transfer(slot, request)
+
+    def _end_transfer(self, slot: Slot, request: Request) -> None:
+        slot.transferring.remove(request)
+        self._process_queue(slot)
+        self.signals.send_catch_log(
+            signal=signals.request_left_downloader,
+            request=request,
+            spider=self.crawler.spider,
+        )
+
+    async def _wait_for_download(
+        self, slot: Slot, request: Request, queue_dfd: Deferred[Response]
+    ) -> None:
+        try:
+            response = await self._download(slot, request)
+        except (Exception, asyncio.CancelledError) as exc:
+            if not queue_dfd.called:
+                queue_dfd.errback(exc)
+        else:
+            queue_dfd.callback(response)  # awaited in _enqueue_request()
+
+    async def stop(self) -> int:
+        self._accepting_requests = False
+
+        dropped_count = 0
+
+        for slot in self.slots.values():
+            slot.close()
+            while slot.queue:
+                request, queue_dfd = slot.queue.popleft()
+                dropped_count += 1
+                if not queue_dfd.called:
+                    queue_dfd.errback(
+                        DownloadCancelledError(
+                            "Request dropped due to fast downloader shutdown"
+                        )
+                    )
+                self.signals.send_catch_log(
+                    signal=signals.request_left_downloader,
+                    request=request,
+                    spider=self.crawler.spider,
+                )
+
+        cancelled_dfds: list[Deferred[None]] = []
+        for download_dfd in list(self._download_tasks.values()):
+            if download_dfd.called:
+                continue
+            dropped_count += 1
+            download_dfd.cancel()
+            cancelled_dfds.append(download_dfd)
+
+        if cancelled_dfds:
+            # Wait for the cancellations themselves to settle, e.g. the
+            # _download_tasks entries to be popped by _download_task_done(),
+            # instead of guessing how many event loop iterations that takes.
+            await maybe_deferred_to_future(
+                DeferredList(cancelled_dfds, consumeErrors=True)
+            )
+
+        return dropped_count
+
+    def close(self) -> None:
+        self._accepting_requests = False
+        self._stop_slot_gc()
+        for slot in self.slots.values():
+            slot.close()
+        self._record_backout(None)
+
+    async def _close_async(self) -> None:
+        """Close the downloader and its download handlers."""
+        self.close()
+        await self.handlers._close()
+
+    def _slot_gc(self, age: float = 60) -> None:
+        mintime = monotonic() - age
+        for key, slot in list(self.slots.items()):
+            if not slot.active and slot.lastseen + slot.delay <= mintime:
+                self.slots.pop(key).close()
+
+    def _start_slot_gc(self) -> None:
+        if self._slot_gc_loop:
+            return
+        self._slot_gc_loop = create_looping_call(self._slot_gc)
+        self._slot_gc_loop.start(self._SLOT_GC_INTERVAL, now=False)
+
+    def _stop_slot_gc(self) -> None:
+        if self._slot_gc_loop:
+            self._slot_gc_loop.stop()
+            self._slot_gc_loop = None

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import csv
 import json
 import marshal
@@ -12,12 +13,14 @@ from urllib.parse import urljoin
 import lxml.etree
 import pytest
 from packaging.version import Version
+from twisted.internet.defer import Deferred
 
 import scrapy
 from scrapy import Spider
 from scrapy.exceptions import NotConfigured
 from scrapy.extensions.feedexport import FeedExporter, S3FeedStorage
 from scrapy.settings import Settings
+from scrapy.utils.asyncio import is_asyncio_available
 from scrapy.utils.python import to_unicode
 from scrapy.utils.test import get_crawler
 from tests.spiders import ItemSpider
@@ -381,6 +384,42 @@ class TestBatchDeliveries(TestFeedExportBase):
         assert crawler.stats
         assert "feedexport/success_count/FileFeedStorage" in crawler.stats.get_stats()
         assert crawler.stats.get_value("feedexport/success_count/FileFeedStorage") == 12
+
+    @coroutine_test
+    async def test_batch_closed_without_close_spider(self):
+        """Regression test for issue #6: a batch's exporter and storage must
+        be finalized (finish_exporting()/storage.store()) as soon as the
+        batch is filled, without waiting for close_spider() to run, i.e.
+        without waiting for the spider to finish crawling."""
+        file_path = build_url(
+            self._random_temp_filename() / "json" / self._file_mark
+        )
+        settings = {
+            "FEEDS": {file_path: {"format": "json"}},
+            "FEED_EXPORT_BATCH_ITEM_COUNT": 1,
+        }
+        crawler = get_crawler(settings_dict=settings)
+        feed_exporter = FeedExporter.from_crawler(crawler)
+        spider = Spider("default")
+        spider.crawler = crawler
+        feed_exporter.open_spider(spider)
+        full_slot = feed_exporter.slots[0]
+
+        feed_exporter.item_scraped(MyItem({"foo": "bar"}), spider)
+
+        # Give the scheduled close_slot() coroutine a chance to run, without
+        # calling close_spider().
+        if is_asyncio_available():
+            await asyncio.sleep(0)
+        else:
+            from twisted.internet import reactor  # noqa: PLC0415
+
+            d: Deferred[None] = Deferred()
+            reactor.callLater(0, d.callback, None)
+            await d
+
+        assert full_slot.file is not None
+        assert full_slot.file.closed
 
     @pytest.mark.requires_boto3
     @inline_callbacks_test

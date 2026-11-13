@@ -6,14 +6,13 @@ See documentation in docs/topics/feed-exports.rst
 
 from __future__ import annotations
 
-import asyncio
 import contextlib
 import logging
 import re
 import sys
 import warnings
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Coroutine
+from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path, PureWindowsPath
 from tempfile import NamedTemporaryFile
@@ -27,7 +26,7 @@ from zope.interface import Interface
 from scrapy import Spider, signals
 from scrapy.exceptions import NotConfigured, ScrapyDeprecationWarning
 from scrapy.extensions.postprocessing import PostProcessingManager
-from scrapy.utils.asyncio import is_asyncio_available, run_in_thread
+from scrapy.utils.asyncio import run_in_thread
 from scrapy.utils.conf import feed_complete_default_values_from_settings
 from scrapy.utils.defer import deferred_from_coro, ensure_awaitable
 from scrapy.utils.ftp import ftp_store_file
@@ -475,7 +474,7 @@ class FeedExporter:
         self.feeds = {}
         self.slots: list[FeedSlot] = []
         self.filters: dict[str, ItemFilter] = {}
-        self._pending_close_coros: list[Coroutine[Any, Any, None]] = []
+        self._pending_close_deferreds: list[Deferred[None]] = []
 
         if not self.settings["FEEDS"] and not self.settings["FEED_URI"]:
             raise NotConfigured
@@ -539,19 +538,12 @@ class FeedExporter:
             )
 
     async def close_spider(self, spider: Spider) -> None:
-        self._pending_close_coros.extend(
-            self._close_slot(slot, spider) for slot in self.slots
+        self._pending_close_deferreds.extend(
+            deferred_from_coro(self._close_slot(slot, spider)) for slot in self.slots
         )
 
-        if self._pending_close_coros:
-            if is_asyncio_available():
-                await asyncio.wait(
-                    [asyncio.create_task(coro) for coro in self._pending_close_coros]
-                )
-            else:
-                await DeferredList(
-                    deferred_from_coro(coro) for coro in self._pending_close_coros
-                )
+        if self._pending_close_deferreds:
+            await DeferredList(self._pending_close_deferreds)
 
         # Send FEED_EXPORTER_CLOSED signal
         await self.crawler.signals.send_catch_log_async(signals.feed_exporter_closed)
@@ -652,7 +644,9 @@ class FeedExporter:
                 uri_params = self._get_uri_params(
                     spider, self.feeds[slot.uri_template]["uri_params"], slot
                 )
-                self._pending_close_coros.append(self._close_slot(slot, spider))
+                self._pending_close_deferreds.append(
+                    deferred_from_coro(self._close_slot(slot, spider))
+                )
                 slots.append(
                     self._start_new_batch(
                         batch_id=slot.batch_id + 1,
